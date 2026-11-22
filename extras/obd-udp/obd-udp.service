@@ -1,0 +1,21 @@
+# 树莓派 systemd unit 示例
+# sudo cp obd_udp_broadcast.py /opt/obd-udp/
+# sudo cp obd-udp.service /etc/systemd/system/
+# sudo systemctl enable --now obd-udp
+[Unit]
+Description=OBD-II 10Hz UDP broadcast for car HUD
+After=bluetooth.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/obd-udp
+Environment=OBD_PORT=/dev/rfcomm0
+Environment=OBD_UDP_PORT=18766
+Environment=OBD_UDP_HZ=10
+ExecStart=/usr/bin/python3 /opt/obd-udp/obd_udp_broadcast.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

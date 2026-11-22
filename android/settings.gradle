@@ -1,0 +1,23 @@
+pluginManagement {
+    repositories {
+        // 2026-11-22: repo.maven.apache.org 在本机被 403（Gradle 默认走的那个域名），
+        // 阿里云镜像可达，放前面；google() 仍在（dl.google.com 正常）。
+        maven { url 'https://maven.aliyun.com/repository/gradle-plugin' }
+        maven { url 'https://maven.aliyun.com/repository/public' }
+        maven { url 'https://maven.aliyun.com/repository/google' }
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        maven { url 'https://maven.aliyun.com/repository/public' }
+        maven { url 'https://maven.aliyun.com/repository/google' }
+        google()
+        mavenCentral()
+    }
+}
+rootProject.name = "vox-x2-client"
+include(":app")

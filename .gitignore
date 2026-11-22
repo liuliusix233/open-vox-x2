@@ -1,0 +1,55 @@
+# ---- secrets & local state ----
+.env
+.env.*
+!.env.example
+local.properties
+*.keystore
+*.jks
+
+# ---- databases / media ----
+*.db
+*.db-journal
+*.db-wal
+*.sqlite
+*.sqlite3
+voiceprints.json
+*.wav
+*.mp3
+*.m4a
+*.pcm
+frames/
+voice-frames/
+
+# ---- user plugins ----
+custom_tools/
+
+# ---- backups ----
+*.bak
+*.bak-*
+*.bak.*
+*.orig
+*.rej
+
+# ---- python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+
+# ---- android / gradle ----
+build/
+.gradle/
+.cxx/
+*.iml
+.idea/
+captures/
+.DS_Store
+
+# ---- logs ----
+*.log
+logs/
+
+# ---- runtime data ----
+data/

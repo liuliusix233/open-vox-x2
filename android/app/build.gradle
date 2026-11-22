@@ -1,0 +1,58 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+android {
+    namespace 'com.openvox.x2'
+    compileSdk 32
+    buildToolsVersion '32.0.0'
+
+    defaultConfig {
+        applicationId "com.openvox.x2"
+        minSdk 30
+        // 2026-11-22: targetSdk 降到 32 —— 本机只有 platform-32 + build-tools 32.0.0，
+        // 且 JDK 11（AGP 8.x 要 JDK17）。API 34 的 FOREGROUND_SERVICE_MICROPHONE
+        // 在 32 上只是被忽略，不影响运行。
+        targetSdk 32
+        versionCode 2
+        versionName "2.0.0"
+
+        // Configure your SER7 LAN IP and public WSS fallback here or via gradle -P flags
+        buildConfigField "String", "LAN_HOST", "\"${project.findProperty('VOX_LAN_HOST') ?: ''}\""
+        buildConfigField "int", "LAN_PORT", "${project.findProperty('VOX_LAN_PORT') ?: 8766}"
+        buildConfigField "String", "WAN_WS_URL", "\"${project.findProperty('VOX_WAN_WS') ?: ''}\""
+        buildConfigField "String", "ADB_TUNNEL_TOKEN", '"' + (project.findProperty('VOX_ADB_TOKEN') ?: '') + '"'
+        buildConfigField "String", "DRIVE_SSID", '"' + (project.findProperty('VOX_DRIVE_SSID') ?: '') + '"'
+        buildConfigField "String", "VOX_TOKEN", "\"${project.findProperty('VOX_TOKEN') ?: ''}\""
+    }
+
+    buildFeatures {
+        buildConfig true
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+        debug {
+            applicationIdSuffix ".debug"
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+    kotlinOptions {
+        jvmTarget = '11'
+    }
+}
+
+dependencies {
+    // 2026-11-22: androidx 全部去掉（appcompat 1.6.1 / core-ktx 1.12.0 要求 compileSdk 33+，
+    // 本机只有 platform-32 且 sdkmanager 需要 JDK17 装不了新版）。MainActivity 改用平台
+    // android.app.Activity，行为不变。
+    implementation 'com.squareup.okhttp3:okhttp:4.11.0'
+}
