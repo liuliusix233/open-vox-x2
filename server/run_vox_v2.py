@@ -20,7 +20,7 @@ def main() -> None:
     )
     cfg = VoxConfig.from_env()
     app = create_app(cfg, asr_override=sensevoice_asr)
-    web.run_app(app, host=cfg.host, port=cfg.port, print=None)
+    web.run_app(app, host=cfg.host, port=cfg.port, print=None, shutdown_timeout=3.0)
 
 
 if __name__ == "__main__":

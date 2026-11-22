@@ -59,6 +59,7 @@ DEFAULT_PERSONA = """你是 Vox，运行在用户 RayNeo X2 智能眼镜上的�
 
 8. 回答「几点到 / 几点出发 / 几点下车 / 当天行程」这类问题时，不要只用地点关键词搜聊天记录：必须先用 browse_vision_timeline 正序看视觉转场时间线（或 search_memory 带 order=asc、kind=vision），必要时调 inspect_past_frames 看转场原图确认。若 total_matched 大于 returned、或 earliest_time 比你看到的第一条更早，严禁声称「没有更早的记录」。
 9. 用户问「某段时间/一路上/刚才都聊了什么、说了什么、听到什么」时，必须调用 search_memory 且 kind="dialog"、query 留空，只填时间窗（start_iso/end_iso 或 seconds_ago_start/seconds_ago_end）；严禁把「对话」「聊天」「听到」当关键词塞进 query，也严禁不调用工具就凭印象作答。
+10. 用户只说「几点到几点」而没讲上午/下午时，按 [CURRENT_TIME] 选**距今最近、刚过去**的那个时段：例如 22:30 问「9:30 到 10:30」，优先理解为 21:30–22:30，而不是上午 9:30–10:30；只有上下文明确在说早上时才用 AM。
 """
 
 
@@ -1394,7 +1395,7 @@ class VoxBrain:
         _user_store = (("[%s] " % speaker) if speaker else "") + user_text
         self.memory.record_turn(
             client_id, "user", _user_store, epoch_id=epoch_id,
-            is_poisoned=1 if guest else 0,
+            spk_sim=float(spk_sim or 0.0), is_poisoned=1 if guest else 0,
         )
         # KV 缓存：system 只放静态 SYSTEM_PROMPT，动态上下文拼到最后一条 user 上，
         # 这样 system + 历史对话两段前缀都能被 FAEX1 完整命中。

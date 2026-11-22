@@ -37,7 +37,8 @@
 | **纯黑光波导 HUD** | 只用纯黑背景 + 高对比描边，避免光波导「看见一块灰底」；亮度有兜底与自适应 |
 | **2×2 功耗自适应 / 真休眠** | 插电 / 电池 × 亮屏 / 息屏 四种策略；真休眠时停心跳、停插话、停联网 |
 | **代码级访客隔离** | 访客模式下工具白名单硬拦截 + 上下文按进入时间戳隔离；门锁/安防域永远拒绝 |
-| **9 套自动化冒烟** | 服务端 9 个测试文件覆盖工具链、双脑、打断、访客、导航、HUD、功耗协议 |
+| **10 套自动化冒烟** | 服务端 10 个测试文件覆盖工具链、双脑、打断、访客、导航、HUD、功耗协议、夜间蒸馏 |
+| **夜间做梦蒸馏** | 每天 03:30 把当天视觉轨迹压成 3–6 条日级锚点、从机主语音提炼持久事实、清理冗余原图；有活跃对话自动跳过 |
 
 ### 四维仿生激素节律与主动智能体（Hormone-Driven Agency）
 
@@ -131,7 +132,7 @@ VOX_TTS_OPENAI_VOICE=alloy
 ```bash
 cd server
 for t in smoke phase1 phase23 social_toolforge bargein guest_mode \
-         duplex_dualbrain power_mode_protocol places; do
+         duplex_dualbrain power_mode_protocol places dream_consolidator; do
   PYTHONPATH=. python3 -m vox_v2.test_$t || exit 1
 done
 ```
@@ -177,6 +178,7 @@ server/
     vision.py photo_lib.py   # 帧索引、关键帧归档、后台打标
     speaker_id.py            # 15ms 级声纹（可选访客模式依赖）
     hormones_v2.py           # 主动开口的节律门控（不发神经）
+    dream_consolidator.py    # 夜间蒸馏：日级锚点 + 事实提炼 + 原图自洁
     test_*.py                # 9 套冒烟
 android/app/src/main/java/com/openvox/x2/
   MainActivity.kt            # HUD 组装、触摸、模式切换
@@ -196,6 +198,7 @@ extras/obd-udp/              # 树莓派 OBD 10Hz UDP 广播（可选）
 | 声纹访客模式 | `VOX_AUTO_GUEST=1` + enroll 声纹；默认只认口令 |
 | 车载 OBD HUD | 跑 `extras/obd-udp`，客户端填 `VOX_DRIVE_SSID` |
 | 双脑插话 | `VOX_DUPLEX_DUAL_BRAIN=1` |
+| 夜间做梦蒸馏 | `systemctl --user enable --now vox-dream.timer`（默认 03:30，先 `--dry-run` 看预览） |
 
 ## 隐私
 

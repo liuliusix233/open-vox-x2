@@ -940,6 +940,49 @@ def create_app(
 
 
 
+    async def on_shutdown(a: web.Application) -> None:
+        """Close live WebSockets and stop agency/watchers so systemd stop is instant.
+
+        aiohttp otherwise waits for every handler to finish; the glasses never hang up
+        on their own, so each restart used to sit there until TimeoutStopSec + SIGKILL.
+        """
+        sessions = list(active_sessions)
+        log.info("SHUTDOWN begin: %d session(s)", len(sessions))
+        for s in sessions:
+            try:
+                await AgencyLoopV2.stop_client(s.client_id)
+            except Exception:
+                pass
+            if coordinator is not None:
+                try:
+                    coordinator.stop_watcher(s.client_id)
+                except Exception:
+                    pass
+            for attr in ("_turn_task", "_proactive_task"):
+                t = getattr(s, attr, None)
+                if t is not None and not t.done():
+                    t.cancel()
+            try:
+                s.speaking = False
+                s._thinking = False
+            except Exception:
+                pass
+        for s in sessions:
+            try:
+                await asyncio.wait_for(
+                    s.ws.close(code=1001, message=b"server_shutdown"), timeout=1.0
+                )
+            except Exception:
+                pass
+        if coordinator is not None:
+            try:
+                await coordinator.shutdown()
+            except Exception:
+                pass
+        log.info("SHUTDOWN done")
+
+    app.on_shutdown.append(on_shutdown)
+
     async def on_cleanup(a: web.Application) -> None:
         if coordinator is not None:
             try:
@@ -1077,7 +1120,7 @@ def create_app(
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     cfg = VoxConfig.from_env()
-    web.run_app(create_app(cfg), host=cfg.host, port=cfg.port)
+    web.run_app(create_app(cfg), host=cfg.host, port=cfg.port, shutdown_timeout=3.0)
 
 
 if __name__ == "__main__":
