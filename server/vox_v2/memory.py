@@ -489,7 +489,7 @@ class MemoryStore:
     ) -> dict[str, Any]:
         """Strict client-scoped search across memory_units, semantic_facts, and user turns.
 
-        2026-11-22 结构升级（设计决定）：
+        2026-11-22 结构升级（机主指令）：
           * order: asc/desc —— 问"最早/几点到"必须能正序看
           * kind:  all/vision/dialog —— 只看视觉转场或只看聊天
           * 视觉帧与对话分开限额：聊天记录不再把 vision_episode 挤掉
@@ -536,6 +536,29 @@ class MemoryStore:
                     )
                     if fp and len(frame_paths) < 4 and os.path.isfile(fp) and fp not in frame_paths:
                         frame_paths.append(fp)
+
+                # 日级 event_anchor 单独补一轮：它们只有 6 条/天，容易被 episode 挤出 limit，
+                # 而且问「某天/某段时间在干嘛」时正是最该被看到的那层摘要。
+                a_sql = (
+                    "SELECT start_ts, search_text FROM memory_units "
+                    "WHERE client_id=? AND kind='event_anchor' AND status='active'"
+                )
+                a_params: list[Any] = [client_id]
+                if start_ts is not None:
+                    a_sql += " AND end_ts >= ?"
+                    a_params.append(start_ts)
+                if end_ts is not None:
+                    a_sql += " AND start_ts <= ?"
+                    a_params.append(end_ts)
+                if q:
+                    a_sql += " AND search_text LIKE ?"
+                    a_params.append("%" + q + "%")
+                a_sql += " ORDER BY start_ts " + direction + " LIMIT 6"
+                for r in self._conn.execute(a_sql, a_params).fetchall():
+                    hits.append(
+                        {"kind": "event_anchor", "time": _fmt_ts(r["start_ts"]),
+                         "text": r["search_text"]}
+                    )
 
                 stat = self._vis_stats(client_id, q, start_ts, end_ts)
                 total_matched += stat[0]

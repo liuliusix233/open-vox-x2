@@ -439,7 +439,8 @@ class DreamConsolidator:
 
     # ------------------------------------------------------------- driver
     async def run(self, date_str: str | None = None, *, dry_run: bool = False,
-                  client_id: str = "voxx2", force: bool = False) -> dict[str, Any]:
+                  client_id: str = "voxx2", force: bool = False,
+                  skip_facts: bool = False) -> dict[str, Any]:
         date_str, day_start, day_end = day_window(date_str)
         report: dict[str, Any] = {"date": date_str, "dry_run": dry_run,
                                   "min_sim": self.min_sim, "keep_days": self.keep_days}
@@ -452,7 +453,12 @@ class DreamConsolidator:
         conn = self._connect()
         try:
             report.update(self.build_anchors(conn, client_id, day_start, day_end, date_str, dry_run))
-            report.update(await self.extract_facts(conn, client_id, day_start, day_end, date_str, dry_run))
+            if skip_facts:
+                report.update({"facts": 0, "inserted": 0, "updated": 0, "utterances": 0,
+                               "facts_skipped": True})
+            else:
+                report.update(await self.extract_facts(conn, client_id, day_start, day_end,
+                                                       date_str, dry_run))
             report.update(self.cleanup_frames(conn, day_end, dry_run))
             if not dry_run:
                 conn.commit()
@@ -475,6 +481,7 @@ def main(argv: list[str] | None = None) -> int:
         "VOX_DB", os.path.expanduser("~/.openclaw/workspace/jarvis/voice_server/vox_unified.db")))
     ap.add_argument("--health-url", default="http://127.0.0.1:8766/health")
     ap.add_argument("--force", action="store_true", help="忽略 /health 繁忙判定")
+    ap.add_argument("--skip-facts", action="store_true", help="只写日级锚点，不做事实抽取")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
 
@@ -485,7 +492,8 @@ def main(argv: list[str] | None = None) -> int:
     dc = DreamConsolidator(
         args.db, keep_days=args.keep_days, min_sim=args.min_sim, health_url=args.health_url
     )
-    report = asyncio.run(dc.run(args.date, dry_run=args.dry_run, force=args.force))
+    report = asyncio.run(dc.run(args.date, dry_run=args.dry_run, force=args.force,
+                               skip_facts=args.skip_facts))
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0
 
