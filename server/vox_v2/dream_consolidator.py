@@ -54,6 +54,26 @@ def _clip(s: str, n: int) -> str:
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
+def _head_caption(group: list[sqlite3.Row]) -> str:
+    for r in group:
+        c = (r["caption_clean"] or r["search_text"] or "").strip()
+        if c:
+            return c
+    return ""
+
+
+def _scene_similar(a: str, b: str) -> bool:
+    """两条画面描述是否属于同一场景（字符二元组 Jaccard > 0.45）。"""
+    def grams(s: str) -> set[str]:
+        t = "".join(ch for ch in s if not ch.isspace())
+        return {t[i:i + 2] for i in range(max(0, len(t) - 1))}
+
+    x, y = grams(a), grams(b)
+    if not x or not y:
+        return False
+    return len(x & y) / float(len(x | y)) > 0.45
+
+
 class DreamConsolidator:
     """Daily consolidation. All writes are idempotent; dry_run touches nothing."""
 
@@ -121,19 +141,46 @@ class DreamConsolidator:
         if not rows:
             return {"anchors": 0, "episodes": 0, "written": 0, "note": "no_vision"}
 
-        # 30 分钟一档
+        # ① 30 分钟一档
         buckets: dict[int, list[sqlite3.Row]] = {}
         for r in rows:
             buckets.setdefault(int((r["start_ts"] - day_start) // ANCHOR_BUCKET_S), []).append(r)
 
-        groups = [v for k, v in sorted(buckets.items()) if v]
+        # ② 相邻且画面相似的桶合并成一段（17:09–19:29 桌面工作 → 1 条）
+        merged: list[list[sqlite3.Row]] = []
+        for _, grp in sorted(buckets.items()):
+            if merged:
+                gap = grp[0]["start_ts"] - merged[-1][-1]["end_ts"]
+                # 同场景合并；或时间相邻且有一侧是低频段（STANDBY/出门 15s 一帧）也合并，
+                # 让"上车→停车场→高速"这类稀疏但连续的移动场景收成一条
+                if _scene_similar(_head_caption(merged[-1]), _head_caption(grp)) or (
+                    gap <= ANCHOR_BUCKET_S and len(merged[-1]) < 25 and len(grp) < 25
+                ):
+                    merged[-1] = merged[-1] + grp
+                    continue
+            merged.append(list(grp))
+
+        # ③ 超过 MAX_ANCHORS 时用「最远点采样」铺满全天：
+        #    先放帧数最多的一段，之后每次挑"离已选点最远"的一段（同距比帧数）。
+        #    这样桌面上 LIVE 1s/帧 的 800 帧不会把出门 STANDBY 15s/帧 的车程挤掉。
+        groups = merged
         if len(groups) > MAX_ANCHORS:
-            # 保留帧数最多的 MAX_ANCHORS 档，再按时间排回去
-            keep = sorted(range(len(groups)), key=lambda i: -len(groups[i]))[:MAX_ANCHORS]
-            groups = [groups[i] for i in sorted(keep)]
-        if len(groups) > MAX_ANCHORS:  # 兜底
-            step = len(groups) / float(MAX_ANCHORS)
-            groups = [groups[int(i * step)] for i in range(MAX_ANCHORS)]
+            starts = [g[0]["start_ts"] for g in groups]
+            seed = max(range(len(groups)), key=lambda i: len(groups[i]))
+            picked = [seed]
+            while len(picked) < MAX_ANCHORS:
+                best_i, best_key = None, None
+                for i in range(len(groups)):
+                    if i in picked:
+                        continue
+                    dist = min(abs(starts[i] - starts[j]) for j in picked)
+                    key = (dist, len(groups[i]))
+                    if best_key is None or key > best_key:
+                        best_i, best_key = i, key
+                if best_i is None:
+                    break
+                picked.append(best_i)
+            groups = [groups[i] for i in sorted(picked)]
 
         anchors = []
         for g in groups:
@@ -155,6 +202,11 @@ class DreamConsolidator:
             span = start_local if start_local == end_local else f"{start_local}–{end_local}"
             # 精炼：只用最代表性的一条画面描述（≤64字）+ 帧数，不堆三段长句
             head = _clip(caps[0], 64) if caps else "画面记录"
+            # 跨场景的时段（如"坐在桌前→上车"）把结尾画面也带一句，避免只记住开头
+            tail_cap = _head_caption(g[-3:]) if len(g) > 3 else ""
+            spans_long = (t1 - t0) > 2400.0     # 只有跨 40 分钟以上的时段才带结尾画面
+            if tail_cap and spans_long and not _scene_similar(head, tail_cap):
+                head = head + " → " + _clip(tail_cap, 32)
             extra = f"（该时段共 {len(g)} 帧）" if len(g) > 1 else ""
             anchors.append({
                 "start_ts": t0,
