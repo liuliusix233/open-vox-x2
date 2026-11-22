@@ -211,6 +211,55 @@ class AmapNavEngine:
             resp.raise_for_status()
             return await resp.json()
 
+    async def regeo(self, lat: float, lon: float, radius: int = 200) -> dict[str, Any] | None:
+        """Reverse geocode: (lat, lon) -> nearest road / house number / district.
+
+        Returns None when no Web-Service key is configured (never raises, never blocks
+        the conversation). Amap expects "lon,lat", so the order is swapped here.
+        """
+        if not self.api_key or self.http is None:
+            return None
+        now = time.time()
+        cache = getattr(self, "_regeo_cache", None)
+        if cache and (now - cache[0]) < 120.0 and abs(cache[1] - lat) < 1e-4 and abs(cache[2] - lon) < 1e-4:
+            return cache[3]
+        try:
+            j = await self._amap_get(
+                "/geocode/regeo",
+                {"location": f"{lon:.6f},{lat:.6f}", "extensions": "base", "radius": radius},
+            )
+        except Exception as exc:
+            log.debug("regeo failed: %s", exc)
+            return None
+        if str(j.get("status")) != "1":
+            log.info("RE_GEO unavailable status=%s info=%s", j.get("status"), j.get("info"))
+            return None
+        rg = j.get("regeocode") or {}
+        comp = rg.get("addressComponent") or {}
+
+        def _flat(v: Any) -> str:
+            if isinstance(v, str):
+                return v.strip()
+            if isinstance(v, dict):
+                return str(v.get("name") or "").strip()
+            if isinstance(v, list):
+                return "".join(str(x.get("name") or "") if isinstance(x, dict) else str(x) for x in v).strip()
+            return ""
+
+        road = _flat(comp.get("road")) or _flat(comp.get("street"))
+        number = _flat(comp.get("number"))
+        township = _flat(comp.get("township"))
+        district = _flat(comp.get("district")) or _flat(comp.get("city"))
+        out = {
+            "road": road,
+            "number": number,
+            "township": township,
+            "district": district,
+            "address": str(rg.get("formatted_address") or "").strip(),
+        }
+        self._regeo_cache = (now, lat, lon, out)
+        return out
+
     async def get_weather(self, client_id: str, city: str = "") -> dict[str, Any]:
         target_city = (city or "").strip() or self.default_city
         now = time.time()

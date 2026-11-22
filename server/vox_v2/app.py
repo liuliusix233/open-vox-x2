@@ -183,6 +183,8 @@ class DuplexSession:
         self._owner_soft_streak: int = 0
         self.last_gps: tuple[float, float, float] | None = None   # (lat_gcj, lon_gcj, acc)
         self.current_place: str = ""
+        self.current_road: str = ""
+        self._road_ts: float = 0.0
         self._place_checked_ts: float = 0.0
         self.power_profile: str = "AC"
         self.heartbeat_mult: float = 1.0
@@ -283,8 +285,25 @@ class DuplexSession:
                 if new_name != self.current_place:
                     log.info("PLACE -> %r (dist=%s)", new_name, hit and hit["distance_m"])
                 self.current_place = new_name
+                # 精确路名：配了高德 Web 服务 Key 时后台补逆地理（60s 一次，失败静默）
+                if (now - self._road_ts) >= 60.0:
+                    self._road_ts = now
+                    try:
+                        asyncio.create_task(self._refresh_road(glat, glon))
+                    except Exception:
+                        pass
         except Exception as exc:
             log.debug("GPS update err %s", exc)
+
+    async def _refresh_road(self, lat: float, lon: float) -> None:
+        try:
+            rg = await self.brain.amap.regeo(lat, lon)
+            road = (rg or {}).get("road") or ""
+            if road and road != self.current_road:
+                self.current_road = road
+                log.info("ROAD -> %r", road)
+        except Exception as exc:
+            log.debug("road refresh err %s", exc)
 
     def _set_guest(self, active: bool, reason: str) -> None:
         if self.guest_mode == active:
@@ -913,7 +932,8 @@ def create_app(
                 g = getattr(_s, "last_gps", None)
                 if g:
                     return {"lat": g[0], "lon": g[1], "acc": g[2],
-                            "place": getattr(_s, "current_place", "")}
+                            "place": getattr(_s, "current_place", ""),
+                            "road": getattr(_s, "current_road", "")}
             return {}
 
         a["brain"].location_fn = _location

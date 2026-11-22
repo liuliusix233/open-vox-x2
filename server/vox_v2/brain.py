@@ -734,8 +734,10 @@ class VoxBrain:
         try:
             loc = self.location_fn() if self.location_fn else None
             place = (loc or {}).get("place") or ""
-            if place and not guest:
-                out += "\n[PLACE] " + place
+            road = (loc or {}).get("road") or ""
+            if not guest and (place or road):
+                _bits = [b for b in (place, road) if b]
+                out += "\n[PLACE] " + " · ".join(_bits)
         except Exception:
             pass
         return out
@@ -895,6 +897,22 @@ class VoxBrain:
             lat, lon = float(loc["lat"]), float(loc["lon"])
             near = self.memory.match_place(client_id, lat, lon)
             out = {"ok": True, "place": (near or {}).get("name") or "unknown地点"}
+            # 精确路名：配了高德「Web 服务」Key 才补逆地理，没有就静默跳过
+            try:
+                rg = await self.amap.regeo(lat, lon)
+                if rg:
+                    if rg.get("road"):
+                        out["road"] = rg["road"]
+                        if rg.get("number"):
+                            out["road"] += rg["number"] if rg["number"][:1].isdigit() else " " + rg["number"]
+                    if rg.get("address"):
+                        out["address"] = rg["address"]
+                    if rg.get("district"):
+                        out["district"] = rg["district"]
+                    if out.get("place") in ("unknown地点", "未知地点") and (rg.get("road") or rg.get("address")):
+                        out["place"] = rg.get("road") or rg.get("address")
+            except Exception as exc:
+                log.debug("where_am_i regeo skip: %s", exc)
             for label in ("家", "公司", "上次停车位"):
                 pl = self.memory.get_place(client_id, label)
                 if pl:
