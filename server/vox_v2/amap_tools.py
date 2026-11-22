@@ -212,17 +212,18 @@ class AmapNavEngine:
             return await resp.json()
 
     async def regeo(self, lat: float, lon: float, radius: int = 200) -> dict[str, Any] | None:
-        """Reverse geocode: (lat, lon) -> nearest road / house number / district.
+        """逆地理编码：经纬度 → 最近道路 / 门牌 / 区县。
 
-        Returns None when no Web-Service key is configured (never raises, never blocks
-        the conversation). Amap expects "lon,lat", so the order is swapped here.
+        没有可用的「Web 服务」Key 时直接返回 None（绝不抛异常、绝不阻塞对话）。
+        高德要求 location 是 "经度,纬度"（先 lon 后 lat），这里统一转换。
         """
-        if not self.api_key or self.http is None:
-            return None
         now = time.time()
         cache = getattr(self, "_regeo_cache", None)
         if cache and (now - cache[0]) < 120.0 and abs(cache[1] - lat) < 1e-4 and abs(cache[2] - lon) < 1e-4:
             return cache[3]
+        if not self.api_key or self.http is None:
+            # 没有「Web 服务」Key：退到 OSM Nominatim（低频、带 UA，符合使用政策）
+            return await self._osm_reverse(lat, lon)
         try:
             j = await self._amap_get(
                 "/geocode/regeo",
@@ -230,10 +231,10 @@ class AmapNavEngine:
             )
         except Exception as exc:
             log.debug("regeo failed: %s", exc)
-            return None
+            return await self._osm_reverse(lat, lon)
         if str(j.get("status")) != "1":
-            log.info("RE_GEO unavailable status=%s info=%s", j.get("status"), j.get("info"))
-            return None
+            log.info("RE_GEO unavailable status=%s info=%s -> OSM", j.get("status"), j.get("info"))
+            return await self._osm_reverse(lat, lon)
         rg = j.get("regeocode") or {}
         comp = rg.get("addressComponent") or {}
 
@@ -257,7 +258,48 @@ class AmapNavEngine:
             "district": district,
             "address": str(rg.get("formatted_address") or "").strip(),
         }
+        out["source"] = "amap"
         self._regeo_cache = (now, lat, lon, out)
+        return out
+
+    async def _osm_reverse(self, lat: float, lon: float) -> dict[str, Any] | None:
+        """无高德 Key 时的逆地理兜底：OpenStreetMap Nominatim（中文返回）。
+
+        只用低频调用（GPS 变化 60s 一次），带 UA，遵循 Nominatim 使用政策。
+        """
+        if self.http is None:
+            return None
+        try:
+            async with self.http.get(
+                "https://nominatim.openstreetmap.org/reverse",
+                params={
+                    "format": "jsonv2",
+                    "lat": f"{lat:.6f}",
+                    "lon": f"{lon:.6f}",
+                    "zoom": 18,
+                    "addressdetails": 1,
+                    "accept-language": "zh-CN",
+                },
+                headers={"User-Agent": "open-vox-x2/0.1 (self-hosted assistant)"},
+                timeout=8,
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                j = await resp.json()
+        except Exception as exc:
+            log.debug("osm reverse failed: %s", exc)
+            return None
+        a = j.get("address") or {}
+        road = str(a.get("road") or a.get("pedestrian") or a.get("footway") or a.get("residential") or "")
+        out = {
+            "road": road,
+            "number": str(a.get("house_number") or ""),
+            "township": str(a.get("suburb") or a.get("neighbourhood") or ""),
+            "district": str(a.get("city_district") or a.get("city") or a.get("county") or ""),
+            "address": str(j.get("display_name") or ""),
+            "source": "osm",
+        }
+        self._regeo_cache = (time.time(), lat, lon, out)
         return out
 
     async def get_weather(self, client_id: str, city: str = "") -> dict[str, Any]:
