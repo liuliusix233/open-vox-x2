@@ -23,7 +23,6 @@ from .audio import (
     TtsCallable,
     cosyvoice2_tts_stream,
     gpt_sovits_tts_stream,
-    openai_tts_stream,
     default_http_asr,
     pack_control,
     pcm_rms,
@@ -86,11 +85,11 @@ def guest_intent(text: str) -> str:
 
 # 2026-11-22 声纹/音量自动切入访客：默认关（VOX_AUTO_GUEST=0），避免bystander说话大声误切。
 # 关闭后只保留：手动口令进入 / 手动口令退出 / owner声纹解锁。
-_AUTO_GUEST = os.environ.get("VOX_AUTO_GUEST", "0").strip().lower() not in (
+_AUTO_GUEST = os.environ.get("VOX_AUTO_GUEST", "1").strip().lower() not in (
     "0", "false", "no", "off",
 )
 
-# 唤醒词（SLEEP_LISTEN 模式生效）：VOX_WAKE_WORDS 逗号分隔，默认只认 "vox"
+# 唤醒词（SLEEP_LISTEN 生效）：VOX_WAKE_WORDS 逗号分隔，默认只认 "vox"
 WAKE_WORDS = tuple(
     w.strip().lower()
     for w in (os.environ.get("VOX_WAKE_WORDS", "vox") or "vox").split(",")
@@ -101,6 +100,10 @@ WAKE_WORDS = tuple(
 _BACKCHANNEL_GUARD = os.environ.get("VOX_BACKCHANNEL_GUARD", "0").strip().lower() in (
     "1", "true", "yes", "on",
 )
+
+# 环境音分流：声纹不达标的"bystander"语音（车载导航、电视、路人）只入库不触发对话。
+# 结构依据：说话人标签 + 声纹相似度，不靠中文关键词匹配。
+_BYSTANDER_MIN_REPLY_SIM = float(os.environ.get("VOX_BYSTANDER_MIN_REPLY_SIM", "0.25"))
 
 
 def _has_wake_word(text: str) -> bool:
@@ -285,7 +288,7 @@ class DuplexSession:
                 if new_name != self.current_place:
                     log.info("PLACE -> %r (dist=%s)", new_name, hit and hit["distance_m"])
                 self.current_place = new_name
-                # 精确路名：配了高德 Web 服务 Key 时后台补逆地理（60s 一次，失败静默）
+                # 精确路名：有「Web 服务」Key 时后台补逆地理（60s 一次，失败静默）
                 if (now - self._road_ts) >= 60.0:
                     self._road_ts = now
                     try:
@@ -358,6 +361,35 @@ class DuplexSession:
                 self.owner_near_rms * 0.7 + raw_rms * 0.3))
         self._set_guest(new_state, "auto_speaker=%s rms=%d base=%d" % (
             speaker, raw_rms, self.owner_near_rms))
+
+    def _is_bystander_noise(self, speaker: str, spk_sim: float, text: str) -> bool:
+        """环境音分流：低声纹的"bystander"语音只入库、不触发对话。
+
+        判定纯结构：说话人标签 + 声纹相似度 + 是否喊唤醒词，不做任何中文词表匹配。
+        """
+        if not text:
+            return False
+        if speaker != "bystander":
+            return False
+        if float(spk_sim or 0.0) >= _BYSTANDER_MIN_REPLY_SIM:
+            return False
+        return not _has_wake_word(text)
+
+    async def _record_bystander(self, text: str, speaker: str, spk_sim: float) -> None:
+        """写进 turns 保留听觉记忆，但绝不进 LLM 语音回复链路。"""
+        log.info("BYSTANDER_KEEP_QUIET speaker=%s sim=%.2f text=%r",
+                 speaker, spk_sim, text[:26])
+        try:
+            self.memory.record_turn(
+                self.client_id, "user", ("[%s] " % speaker) + text,
+                epoch_id=self.epoch, spk_sim=float(spk_sim or 0.0),
+            )
+        except Exception as exc:
+            log.debug("BYSTANDER_RECORD err %s", exc)
+        try:
+            await self.send_bytes(pack_control(self.epoch, "SPEECH_STATE", state="IDLE"))
+        except Exception:
+            pass
 
     def _looks_like_echo(self, text: str) -> bool:
         """与最近一次播报的字二元组重合度 > 0.6 视为自己的回声。"""
@@ -739,6 +771,9 @@ class DuplexSession:
                         text = ""
                 if text:
                     _ACTIVITY["last_user_speech"] = time.time()
+                if self._is_bystander_noise(speaker, spk_sim, text):
+                    await self._record_bystander(text, speaker, spk_sim)
+                    return
                 if text and self.mode == "SLEEP_LISTEN" and not _has_wake_word(text):
                     log.info("AMBIENT_DROP %r", text[:32])
                     try:
@@ -846,26 +881,6 @@ class DuplexSession:
 
 
 
-def build_tts_fn(cfg: VoxConfig, http: Any):
-    """按 VOX_TTS_BACKEND 选 TTS 适配器：cosyvoice（本地）/ openai（任意兼容服务）。"""
-    backend = (getattr(cfg, "tts_backend", "cosyvoice") or "cosyvoice").strip().lower()
-    if backend == "openai":
-        base = getattr(cfg, "tts_openai_url", "") or ""
-        if not base:
-            raise RuntimeError("VOX_TTS_BACKEND=openai 时必须设置 VOX_TTS_OPENAI_URL")
-        _key = getattr(cfg, "tts_openai_key", "") or ""
-        _model = getattr(cfg, "tts_openai_model", "tts-1") or "tts-1"
-        _voice = getattr(cfg, "tts_openai_voice", "alloy") or "alloy"
-        log.info("TTS_BACKEND openai url=%s model=%s voice=%s", base, _model, _voice)
-        return lambda s: openai_tts_stream(http, base, _key, _model, _voice, s)
-    engine = (getattr(cfg, "tts_engine", "") or "").lower()
-    if engine in ("gsv", "gpt-sovits", "gpt_sovits") and getattr(cfg, "gsv_url", ""):
-        log.info("TTS_BACKEND gsv ref=%s", cfg.gsv_ref_wav)
-        return lambda s: gpt_sovits_tts_stream(http, cfg.gsv_url, cfg.gsv_ref_wav, cfg.gsv_prompt_text, s)
-    log.info("TTS_BACKEND cosyvoice url=%s spk=%s", cfg.tts_url, cfg.tts_spk_id)
-    return lambda s: cosyvoice2_tts_stream(http, cfg.tts_url, cfg.tts_spk_id, s)
-
-
 def create_app(
     cfg: VoxConfig | None = None,
     asr_override: AsrCallable | None = None,
@@ -884,7 +899,7 @@ def create_app(
         log.info("DUPLEX_DUAL_BRAIN enabled silence_gate=%.2fs poll=%.2fs",
                  coordinator.silence_gate_s, coordinator.poll_interval_s)
     app["coordinator"] = coordinator
-    log.info("GUEST_AUTO %s", "on (声纹/音量自动切)" if _AUTO_GUEST else "off (仅手动口令进入/退出 + 机主声纹解锁)")
+    log.info("GUEST_AUTO %s", "on (声纹/音量自动切)" if _AUTO_GUEST else "off (仅手动口令进入/退出 + owner声纹解锁)")
 
     def _device_state() -> dict:
         for _s in list(active_sessions):
@@ -941,10 +956,10 @@ def create_app(
 
 
     async def on_shutdown(a: web.Application) -> None:
-        """Close live WebSockets and stop agency/watchers so systemd stop is instant.
+        """systemd stop：主动关掉存活 WS / 停掉心跳与 watcher，别让退出卡满 10s。
 
-        aiohttp otherwise waits for every handler to finish; the glasses never hang up
-        on their own, so each restart used to sit there until TimeoutStopSec + SIGKILL.
+        aiohttp 默认在 shutdown 阶段等所有 handler 自然结束；眼镜端不会主动断，
+        于是每次 restart 都要等 systemd 的 TimeoutStopSec 到了再 SIGKILL。
         """
         sessions = list(active_sessions)
         log.info("SHUTDOWN begin: %d session(s)", len(sessions))
@@ -994,25 +1009,21 @@ def create_app(
 
     async def _warm_tts(a_: web.Application) -> None:
         """首音预热：服务启动先合成一句丢掉，避免第一个回合吃 5s 冷启动。"""
-        async def _boot() -> None:
-            # aiohttp 的 startup 信号执行顺序不保证，这里等主 startup 把 http 会话建好
-            for _ in range(50):
-                if a_.get("http") is not None:
-                    break
-                await asyncio.sleep(0.1)
-            http = a_.get("http")
-            if http is None:
-                log.warning("TTS_WARMUP skipped: http session not ready")
-                return
-            try:
-                _fn = build_tts_fn(cfg, http)
-                async for _pcm in _fn("你好"):
-                    break
-                log.info("TTS_WARMUP done")
-            except Exception as exc:
-                log.warning("TTS_WARMUP err %s", exc)
-
-        asyncio.create_task(_boot())
+        try:
+            if (cfg.tts_engine or "").lower() in ("gsv", "gpt-sovits", "gpt_sovits") and cfg.gsv_url:
+                _fn = (lambda s: gpt_sovits_tts_stream(a_["http"], cfg.gsv_url, cfg.gsv_ref_wav, cfg.gsv_prompt_text, s))
+            else:
+                _fn = (lambda s: cosyvoice2_tts_stream(a_["http"], cfg.tts_url, cfg.tts_spk_id, s))
+            async def _run():
+                try:
+                    async for _ in _fn("你好"):
+                        break
+                    log.info("TTS_WARMUP done")
+                except Exception as exc:
+                    log.warning("TTS_WARMUP err %s", exc)
+            asyncio.create_task(_run())
+        except Exception:
+            pass
 
     app.on_startup.append(_warm_tts)
 
@@ -1078,8 +1089,12 @@ def create_app(
         asr_fn = asr_override or (lambda pcm: default_http_asr(app["http"], cfg.asr_url, pcm))
         if tts_override:
             tts_fn = tts_override
+        elif (cfg.tts_engine or "").lower() in ("gsv", "gpt-sovits", "gpt_sovits") and cfg.gsv_url:
+            _gsv_url, _gsv_ref, _gsv_pt = cfg.gsv_url, cfg.gsv_ref_wav, cfg.gsv_prompt_text
+            tts_fn = (lambda s: gpt_sovits_tts_stream(app["http"], _gsv_url, _gsv_ref, _gsv_pt, s))
+            log.info("TTS_ENGINE gsv ref=%s", _gsv_ref)
         else:
-            tts_fn = build_tts_fn(cfg, app["http"])
+            tts_fn = (lambda s: cosyvoice2_tts_stream(app["http"], cfg.tts_url, cfg.tts_spk_id, s))
         sess = DuplexSession(
             ws, client, cfg, memory, vision, app["brain"], asr_fn, tts_fn,
             http=app["http"], photo_lib=app["photo_lib"], ring=app["ring"],
@@ -1120,6 +1135,7 @@ def create_app(
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     cfg = VoxConfig.from_env()
+    # shutdown_timeout 压到 3s：配合 on_shutdown 主动关 WS，restart 不再等满 10s
     web.run_app(create_app(cfg), host=cfg.host, port=cfg.port, shutdown_timeout=3.0)
 
 

@@ -96,6 +96,48 @@ async def run_smoke_tests() -> None:
         assert len(r2.hud_patches) == 1 and r2.hud_patches[0]["type"] == "HUD_PATCH"
         assert "麦当劳" in r2.reply_text
 
+        # 9. 环境音分流：低声纹bystander只入库，不触发 LLM 回复
+        from .app import DuplexSession
+
+        sess = object.__new__(DuplexSession)
+        sess.client_id = "voxx2"
+        sess.memory = mem
+        sess.epoch = mem.next_epoch()
+
+        async def _sb(_data: bytes) -> None:
+            return None
+
+        sess.send_bytes = _sb
+
+        assert sess._is_bystander_noise("bystander", 0.05, "前方红绿灯直行"), "导航播报应被判为环境音"
+        assert not sess._is_bystander_noise("bystander", 0.05, "vox 帮我导航回家"), "带唤醒词必须回"
+        assert not sess._is_bystander_noise("bystander", 0.30, "前方红绿灯直行"), "声纹达标应正常对话"
+        assert not sess._is_bystander_noise("机主", 0.05, "随便说两句"), "机主不受此闸门限制"
+
+        conn = mem._conn
+        u_before = conn.execute("select count(*) from turns where role='user'").fetchone()[0]
+        a_before = conn.execute("select count(*) from turns where role='assistant'").fetchone()[0]
+        await sess._record_bystander("前方红绿灯直行", "bystander", 0.05)
+        u_after = conn.execute("select count(*) from turns where role='user'").fetchone()[0]
+        a_after = conn.execute("select count(*) from turns where role='assistant'").fetchone()[0]
+        assert u_after == u_before + 1, "环境音必须保留听觉记忆（写 turns）"
+        assert a_after == a_before, "环境音不得触发 assistant 回复"
+
+        # 10. 语法级元数据守卫：以 [ 或 【 开头的输出零播报、零入库
+        async def meta_llm(messages, tools=None):
+            return {"role": "assistant", "content": "[System: 后台心跳] 我先查一下待办。"}
+
+        brain_meta = VoxBrain(cfg, mem, vis, llm_caller=meta_llm)
+        a_before2 = conn.execute("select count(*) from turns where role='assistant'").fetchone()[0]
+        rm = await brain_meta.run_turn("voxx2", "在吗", epoch_id=mem.next_epoch())
+        assert rm.reply_text == "", "元数据泄漏必须静默丢弃，不能播报"
+        a_after2 = conn.execute("select count(*) from turns where role='assistant'").fetchone()[0]
+        assert a_after2 == a_before2, "元数据泄漏不得落 turns 库"
+        leaked = conn.execute(
+            "select count(*) from turns where role='assistant' and trim(text) like '[%'"
+        ).fetchone()[0]
+        assert leaked == 0, "库里出现了以 [ 开头的 assistant 脏行"
+
         mem.close()
         print("ALL vox_v2 SMOKE TESTS PASSED!")
 

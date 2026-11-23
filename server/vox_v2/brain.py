@@ -39,15 +39,41 @@ FRAME_ARCHIVE_DIR = os.environ.get(
 WEEKDAYS_ZH = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
 # 对话回合里不允许出声的"通道标记/舞台说明"
-_MARK_HEAD_RE = re.compile(r"^\s*[\[【]\s*(?:主动|AGENCY|心跳|后台)")
-_META_ONLY_RE = re.compile(r"^\s*[（(][^）)]{0,60}[）)]\s*$")
+# 纯语法守卫（零中文词表）：正文只要以 "[" 或 "【" 开头，就判定为系统元数据泄漏。
+_META_HEAD = ("[", "【")
+# 历史 user 消息开头的 [bystander]/[owner] 角色前缀：只在动态上下文里交代说话人，历史里一律剥掉
+_ROLE_PREFIX_RE = re.compile(r"^\s*\[[^\]\n]{1,16}\]\s*")
+
+
+def _clean_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """只给推理服务发协议字段，并保证 content 永远是字符串。
+
+    两个坑：① 流式回合会把 _spoken/_agency_marked 挂在消息上；② 带工具调用的
+    assistant 消息 content 是 None。Halogen 0.20.7 的 chat template 遇到非字符串
+    content 直接 400 "Unexpected content type"。
+    """
+    out: list[dict[str, Any]] = []
+    for m in messages:
+        mm = {k: v for k, v in m.items()
+              if not str(k).startswith("_") and k != "finish_reason"}
+        _c = mm.get("content")
+        if _c is None:
+            mm["content"] = ""
+        elif not isinstance(_c, (str, list)):
+            # 工具执行器可能直接返回 dict（如 app._agency_tool），chat template 只认字符串
+            try:
+                mm["content"] = json.dumps(_c, ensure_ascii=False)
+            except Exception:
+                mm["content"] = str(_c)
+        out.append(mm)
+    return out
 
 GUEST_TOOL_ALLOW = {"describe_live_view", "get_weather", "do_nothing", "inspect_recent_frames"}
 GUEST_CTRL_ALLOW = {"set_brightness", "set_volume"}
-GUEST_BLOCK_MSG = "当前为访客模式，已保护机主隐私与设备权限"
+GUEST_BLOCK_MSG = "当前为访客模式，已保护owner隐私与设备权限"
 
 
-DEFAULT_PERSONA = """你是 Vox，运行在用户 RayNeo X2 智能眼镜上的实时语音助手。
+SYSTEM_PROMPT = """你是 Vox，运行在用户雷鸟 X2 智能眼镜上的实时个人语音助手。
 回答铁律：
 1. 用自然、简短、口语化的中文直接回答（适合语音播报，不要用 Markdown 符号、列表星号或冗长客套）。
 2. 当前精确北京时间已在头部 [CURRENT_TIME] 给出，问时间/日期/星期直接回答，绝不瞎猜。
@@ -61,23 +87,6 @@ DEFAULT_PERSONA = """你是 Vox，运行在用户 RayNeo X2 智能眼镜上的�
 9. 用户问「某段时间/一路上/刚才都聊了什么、说了什么、听到什么」时，必须调用 search_memory 且 kind="dialog"、query 留空，只填时间窗（start_iso/end_iso 或 seconds_ago_start/seconds_ago_end）；严禁把「对话」「聊天」「听到」当关键词塞进 query，也严禁不调用工具就凭印象作答。
 10. 用户只说「几点到几点」而没讲上午/下午时，按 [CURRENT_TIME] 选**距今最近、刚过去**的那个时段：例如 22:30 问「9:30 到 10:30」，优先理解为 21:30–22:30，而不是上午 9:30–10:30；只有上下文明确在说早上时才用 AM。
 """
-
-
-def _load_persona() -> str:
-    """人设可外置：VOX_PERSONA_FILE 指向的纯文本优先，否则用内置通用人设。"""
-    path = os.environ.get("VOX_PERSONA_FILE", "").strip()
-    if path:
-        try:
-            with open(os.path.expanduser(path), encoding="utf-8") as f:
-                txt = f.read().strip()
-            if txt:
-                return txt
-        except OSError as exc:
-            log.warning("PERSONA_FILE %s 读取失败：%s", path, exc)
-    return DEFAULT_PERSONA
-
-
-SYSTEM_PROMPT = _load_persona()
 
 TOOLS_SCHEMA: list[dict[str, Any]] = [
     {
@@ -545,16 +554,16 @@ class VoxBrain:
         """SSE 流式调用：正文按句抢跑（回调给 TTS），tool_calls 攒完照常返回。"""
         payload: dict[str, Any] = {
             "model": self.cfg.llm_model,
-            "messages": messages,
+            # 只发协议字段：流式回合会把 _spoken/_agency_marked 这类私有键挂在 msg 上，
+            # 原样回传会被严格校验的推理服务判 400 Bad Request
+            "messages": _clean_messages(messages),
             "temperature": self.cfg.llm_temperature,
             "stream": True,
         }
-        # 开源兼容：留空就完全不注入推理参数（标准 OpenAI / vLLM / Ollama / llama.cpp）
-        _eff = (getattr(self.cfg, "llm_reasoning_effort", "") or "").strip().lower()
-        if _eff:
-            payload["reasoning_effort"] = _eff
-            if _eff != "none":
-                payload["max_thinking_tokens"] = int(getattr(self.cfg, "llm_max_thinking", 128) or 0)
+        _eff = (getattr(self.cfg, "llm_reasoning_effort", "low") or "low").lower()
+        payload["reasoning_effort"] = _eff
+        if _eff != "none":
+            payload["max_thinking_tokens"] = int(getattr(self.cfg, "llm_max_thinking", 128) or 0)
         if not getattr(self.cfg, "llm_thinking", False):
             payload["chat_template_kwargs"] = {"enable_thinking": False}
         if tools:
@@ -610,13 +619,10 @@ class VoxBrain:
                             buf = buf[cut:]
                             if not sent_piece:
                                 continue
-                            if not _marked and not spoken_text and _MARK_HEAD_RE.match(sent_piece):
+                            if not _marked and not spoken_text and sent_piece.lstrip().startswith(_META_HEAD):
                                 _marked = True
-                                log.info("STREAM_MARK_DROP head=%r", sent_piece[:24])
+                                log.info("STREAM_META_DROP head=%r", sent_piece[:24])
                             if _marked:
-                                continue
-                            if _META_ONLY_RE.match(sent_piece):
-                                log.info("STREAM_META_DROP piece=%r", sent_piece[:24])
                                 continue
                             if not _first_logged:
                                 _first_logged = True
@@ -638,7 +644,7 @@ class VoxBrain:
                         cur["arguments"] += fn["arguments"]
         if on_sentence is not None and not tool_calls and not _marked:
             _tail = buf.strip()
-            if _tail and _META_ONLY_RE.match(_tail):
+            if _tail.lstrip().startswith(_META_HEAD):
                 log.info("STREAM_META_DROP tail=%r", _tail[:24])
                 _tail = ""
             if _tail:
@@ -656,6 +662,8 @@ class VoxBrain:
                  "function": {"name": v["name"], "arguments": v["arguments"] or "{}"}}
                 for k, v in sorted(tool_calls.items())
             ]
+        if _marked:
+            log.info("LLM_META_SUPPRESSED head=%r", content[:40])
         if _ttft is not None:
             log.info("LLM_STREAM ttft=%.0fms chars=%d tools=%d", _ttft, len(content), len(tool_calls))
         return msg
@@ -671,14 +679,13 @@ class VoxBrain:
             return await self._custom_caller(messages, tools)
         payload: dict[str, Any] = {
             "model": self.cfg.llm_model,
-            "messages": messages,
+            "messages": _clean_messages(messages),
             "temperature": self.cfg.llm_temperature,
         }
-        _eff = (reasoning_effort or getattr(self.cfg, "llm_reasoning_effort", "") or "").strip().lower()
-        if _eff:
-            payload["reasoning_effort"] = _eff
-            if _eff != "none":
-                payload["max_thinking_tokens"] = int(getattr(self.cfg, "llm_max_thinking", 128) or 0)
+        _eff = (reasoning_effort or getattr(self.cfg, "llm_reasoning_effort", "low") or "low").lower()
+        payload["reasoning_effort"] = _eff
+        if _eff != "none":
+            payload["max_thinking_tokens"] = int(getattr(self.cfg, "llm_max_thinking", 128) or 0)
         if not getattr(self.cfg, "llm_thinking", False):
             payload["chat_template_kwargs"] = {"enable_thinking": False}
         if tools:
@@ -695,7 +702,22 @@ class VoxBrain:
         async with self.http_session.post(
             self.cfg.llm_url, json=payload, headers=headers, timeout=_ct,
         ) as resp:
-            resp.raise_for_status()
+            if resp.status >= 400:
+                _body = (await resp.text())[:600]
+                try:
+                    _struct = [
+                        {"role": m.get("role"),
+                         "ctype": type(m.get("content")).__name__,
+                         "clen": len(m.get("content") or "") if isinstance(m.get("content"), (str, list)) else -1,
+                         "keys": sorted(k for k in m.keys() if k not in ("role", "content"))}
+                        for m in payload.get("messages") or []
+                    ]
+                    _tk = [t.get("function", {}).get("name") for t in (payload.get("tools") or [])]
+                    log.error("LLM_HTTP_%d body=%s struct=%s tools_n=%d tools=%s",
+                              resp.status, _body, _struct, len(_tk), _tk[:8])
+                except Exception:
+                    log.error("LLM_HTTP_%d body=%s", resp.status, _body)
+                raise RuntimeError(f"LLM {resp.status}: {_body[:200]}")
             data = await resp.json()
             _msg = data["choices"][0]["message"]
             try:
@@ -897,8 +919,8 @@ class VoxBrain:
             from .geo import haversine_m
             lat, lon = float(loc["lat"]), float(loc["lon"])
             near = self.memory.match_place(client_id, lat, lon)
-            out = {"ok": True, "place": (near or {}).get("name") or "unknown地点"}
-            # 精确路名：配了高德「Web 服务」Key 才补逆地理，没有就静默跳过
+            out = {"ok": True, "place": (near or {}).get("name") or "未知地点"}
+            # 精确路名：有「Web 服务」Key 时补逆地理，没有就静默跳过
             try:
                 rg = await self.amap.regeo(lat, lon)
                 if rg:
@@ -910,7 +932,7 @@ class VoxBrain:
                         out["address"] = rg["address"]
                     if rg.get("district"):
                         out["district"] = rg["district"]
-                    if out.get("place") in ("unknown地点", "未知地点") and (rg.get("road") or rg.get("address")):
+                    if out.get("place") == "未知地点" and (rg.get("road") or rg.get("address")):
                         out["place"] = rg.get("road") or rg.get("address")
             except Exception as exc:
                 log.debug("where_am_i regeo skip: %s", exc)
@@ -1390,7 +1412,7 @@ class VoxBrain:
             _dyn_tail = (
                 _dyn_tail + "\n" + social_block +
                 "\n[注意] 若当前这句是直接对你说的（提问或指令），必须正常回答；"
-                "只有其他人之间闲聊、没在问你时，才 do_nothing(situation_note=...)。"
+                "只有bystander之间闲聊、没在问你时，才 do_nothing(situation_note=...)。"
             )
         _user_store = (("[%s] " % speaker) if speaker else "") + user_text
         self.memory.record_turn(
@@ -1411,15 +1433,21 @@ class VoxBrain:
             except Exception:
                 _recent = []
             for t in _recent:
-                messages.append({"role": t["role"], "content": t["text"]})
+                _txt = t["text"]
+                if t["role"] == "user":
+                    _txt = _ROLE_PREFIX_RE.sub("", _txt)
+                messages.append({"role": t["role"], "content": _txt})
             _ctx = "\n".join([
                 _build_time_line(),
                 "[GUEST_MODE] 当前佩戴者是访客而非owner，请礼貌简短接待、可介绍眼前画面或陪聊，"
-                "严禁透露任何机主隐私或假装执行已禁用的权限。",
+                "严禁透露任何owner隐私或假装执行已禁用的权限。",
             ])
         else:
             for t in self.memory.get_recent_turns(client_id, limit=6)[:-1]:
-                messages.append({"role": t["role"], "content": t["text"]})
+                _txt = t["text"]
+                if t["role"] == "user":
+                    _txt = _ROLE_PREFIX_RE.sub("", _txt)
+                messages.append({"role": t["role"], "content": _txt})
             _ctx = self._build_context_header(client_id, guest=guest) + _dyn_tail
         messages.append({"role": "user", "content": user_text + "\n\n" + _ctx})
 
@@ -1488,6 +1516,11 @@ class VoxBrain:
                 if _ep:
                     hud_patches.append(_ep)
         hud_patches = merge_turn_hud_patches(hud_patches)
+        # 极简语法守卫：正文以 [ 或 【 开头 = 系统元数据泄漏 → 静默、不播报、不落库
+        if reply and reply.lstrip().startswith(_META_HEAD):
+            log.info("TURN_META_DROP reply=%r", reply[:40])
+            self._silenced_turn = True
+            reply = ""
         if self._silenced_turn:
             # 明确选择不插嘴：不落 assistant 记录、不出声
             log.info("TURN_SILENT speaker=%r text=%r", speaker, user_text[:40])

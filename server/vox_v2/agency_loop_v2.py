@@ -37,14 +37,22 @@ DEDUP_WINDOW_S = float(os.environ.get("VOX_PROACTIVE_DEDUP_S", "600"))
 DEDUP_RATIO = 0.6
 
 # 模型偶尔会把「[主动] xxx」当成正文吐出来，这个标记只属于主动播报通道
-_MARKER_RE = re.compile(r"^\s*[\[【]\s*(?:主动|AGENCY|心跳|后台)[^\]】]*[\]】]\s*")
+_MARKER_RE = re.compile(r"^\s*[\[【][^\]】\n]{0,40}[\]】]\s*")
 _META_RE = re.compile(r"^\s*[（(][^）)]{0,40}[）)]\s*$")
 
 
 def strip_proactive_marker(text: str) -> str:
-    """去掉正文里混进来的 [主动] 之类通道标记。"""
-    out = _MARKER_RE.sub("", text or "")
-    return out.strip()
+    """剥掉正文开头任意 [ ... ] / 【 ... 】 元数据块。
+
+    纯语法规则，不认具体中文词：任何方括号开头的前缀都不属于口语正文。
+    """
+    out = (text or "").strip()
+    for _ in range(3):
+        nxt = _MARKER_RE.sub("", out).strip()
+        if nxt == out or not nxt:
+            break
+        out = nxt
+    return out
 
 
 def _bigrams(s: str) -> set[str]:
@@ -313,6 +321,7 @@ class AgencyLoopV2:
             if self.state_provider().get("busy"):
                 return {"action": "skip", "reason": "preempted_by_user", "tools": tools_trace}
             msg = await self.llm_caller(messages, self.unified_tools)
+            log.debug("AGENCY_LLM ok step=%d", _step)
             tool_calls = msg.get("tool_calls") or []
             if not tool_calls:
                 return {"action": "do_nothing", "reason": "no_tool_call", "tools": tools_trace}
@@ -368,6 +377,9 @@ class AgencyLoopV2:
                 else:
                     # Silent investigation or state update (get_weather / search_memory / start_navigation / etc.)
                     tool_out = await self.tool_executor(name, args)
+                    if not isinstance(tool_out, str):
+                        # tool executor 可能返回 dict；chat template 只接受字符串 content
+                        tool_out = json.dumps(tool_out, ensure_ascii=False, default=str)
                     messages.append({"role": "tool", "tool_call_id": tc_id, "content": tool_out})
 
             if terminal_result is not None:
